@@ -11,6 +11,11 @@
 
 local PREFIX = "[YetAnotherMinimapLoc] "
 
+local UEHelpers = nil
+pcall(function()
+    UEHelpers = require("UEHelpers")
+end)
+
 local function log(msg)
     print(PREFIX .. tostring(msg))
 end
@@ -870,14 +875,17 @@ local function localizeSettingsPanel(panel, lang)
 end
 
 -- ---------------------------------------------------------------------------
--- Poll: keep this CHEAP. Full widget walks destroy FPS if done every tick.
--- Strategy:
---   * Floating HUD button: localize once per world, then stop.
---   * Settings panel: full localize on open + one delayed follow-up for late rows.
---   * While open: only refresh toggle chrome every few seconds (bIsOn changes).
---   * English culture: almost no work after float button is done.
+-- Poll: keep this CHEAP. Settings UI only exists on title/main-menu flows.
+-- During actual gameplay we do almost nothing (no FindAllOf spam).
 -- ---------------------------------------------------------------------------
-local POLL_MS = 1000
+local POLL_MS = 1500
+
+-- Title / login / splash maps where the minimap settings button exists.
+local MENU_WORLDS = {
+    PL_PPSplash = true,
+    PL_Login = true,
+    PL_Title = true,
+}
 
 local lastPanelKey = nil
 local panelPhase = 0          -- 0 idle, 1 opened(need full), 2 need follow-up, 3 settled
@@ -887,6 +895,9 @@ local floatDone = false
 local nextFloatCheckAt = 0
 local nextPanelScanAt = 0
 local lastFloatLog = ""
+local lastMenuContext = nil
+local cachedWorldName = nil
+local cachedWorldAt = 0
 
 local function objectKey(obj)
     if not isAlive(obj) then return nil end
@@ -895,6 +906,49 @@ local function objectKey(obj)
     end)
     if ok then return s end
     return tostring(obj)
+end
+
+local function currentWorldName()
+    local now = os.clock()
+    if cachedWorldName ~= nil and (now - cachedWorldAt) < 2.0 then
+        return cachedWorldName
+    end
+    local name = nil
+    pcall(function()
+        if UEHelpers == nil then return end
+        local w = UEHelpers.GetWorld()
+        if w == nil then return end
+        if w.GetName ~= nil then
+            name = asString(w:GetName())
+        elseif w.GetFullName ~= nil then
+            name = asString(w:GetFullName())
+        end
+    end)
+    cachedWorldName = name
+    cachedWorldAt = now
+    return name
+end
+
+-- true  => title/login/splash/unknown (allow settings work)
+-- false => likely in a gameplay map (skip panel FindAllOf entirely)
+local function isMenuContext()
+    local n = currentWorldName()
+    if n == nil or n == "" then
+        return true
+    end
+    if MENU_WORLDS[n] then
+        return true
+    end
+    local lower = n:lower()
+    if lower:find("title", 1, true)
+        or lower:find("login", 1, true)
+        or lower:find("splash", 1, true)
+        or lower:find("startup", 1, true)
+        or lower:find("menu", 1, true)
+    then
+        return true
+    end
+    return false
 end
 
 local function findSettingsPanels()
@@ -919,10 +973,33 @@ end
 local function tickLocalize()
     local now = os.clock()
     local lang = detectMenuLanguage(false)
+    local menu = isMenuContext()
 
-    -- --- Floating open button (once per world) ---
+    if menu ~= lastMenuContext then
+        lastMenuContext = menu
+        log(string.format(
+            "context=%s world=%s lang=%s",
+            menu and "menu" or "gameplay",
+            tostring(currentWorldName()),
+            tostring(lang)
+        ))
+        if not menu then
+            -- Entered a save/world: drop panel state; keep floatDone so we don't
+            -- keep re-touching the HUD button every few seconds.
+            lastPanelKey = nil
+            panelPhase = 0
+            nextPanelScanAt = now + 30
+        else
+            -- Back on title/menu: allow a fresh float pass if needed.
+            nextFloatCheckAt = 0
+            nextPanelScanAt = 0
+        end
+    end
+
+    -- --- Floating open button ---
+    -- Once per menu session is enough; in gameplay only try once if not done.
     if not floatDone and now >= nextFloatCheckAt then
-        nextFloatCheckAt = now + 3.0
+        nextFloatCheckAt = now + (menu and 2.5 or 8.0)
         local okf, nBtn, nCh = pcall(function()
             return localizeFloatingSettingsButton(lang)
         end)
@@ -936,17 +1013,22 @@ local function tickLocalize()
         end
     end
 
-    -- English stock UI: nothing else to do after float button.
+    -- Gameplay: no settings UI exists — do not FindAllOf the panel forever.
+    if not menu then
+        return
+    end
+
+    -- English stock UI on menu: nothing else after float button.
     if lang ~= "zh" then
         return
     end
 
-    -- Panel presence scan at ~1 Hz (FindAllOf is not free).
+    -- Panel presence scan (menu only). Slow when idle; fast after open.
     if now < nextPanelScanAt and panelPhase == 0 then
         return
     end
     if panelPhase == 0 then
-        nextPanelScanAt = now + 2.0
+        nextPanelScanAt = now + 2.5
     end
 
     local panels = findSettingsPanels()
@@ -967,7 +1049,6 @@ local function tickLocalize()
     end
 
     if panelPhase == 1 then
-        -- Full localize once on open
         for _, panel in ipairs(panels) do
             local ok, err = pcall(localizeSettingsPanel, panel, lang)
             if not ok then log("localize failed: " .. tostring(err)) end
@@ -978,7 +1059,6 @@ local function tickLocalize()
     end
 
     if panelPhase == 2 and now >= panelFollowupAt then
-        -- One follow-up for rows built a tick late (color picker etc.)
         for _, panel in ipairs(panels) do
             local ok, err = pcall(localizeSettingsPanel, panel, lang)
             if not ok then log("localize follow-up failed: " .. tostring(err)) end
@@ -988,8 +1068,7 @@ local function tickLocalize()
         return
     end
 
-    -- Settled: only keep toggle selected-state chrome fresh (cheap).
-    if panelPhase == 3 and now - lastToggleStyleAt >= 2.0 then
+    if panelPhase == 3 and now - lastToggleStyleAt >= 2.5 then
         lastToggleStyleAt = now
         pcall(refreshToggleStylesOnly, lang)
     end
@@ -1001,27 +1080,27 @@ local function onWorldChange()
     local now = os.clock()
     if now - lastWorldClearAt < 8 then return end
     lastWorldClearAt = now
+    -- Do NOT force floatDone=false here: world streaming during gameplay would
+    -- re-trigger HUD work every few seconds. Menu entry resets via isMenuContext.
     clearLanguageCache()
     lastPanelKey = nil
     panelPhase = 0
-    floatDone = false
-    nextFloatCheckAt = 0
     nextPanelScanAt = 0
-    lastFloatLog = ""
-    log("world change; localization caches cleared")
+    lastMenuContext = nil
+    cachedWorldName = nil
+    cachedWorldAt = 0
 end
 
 pcall(function()
     NotifyOnNewObject("/Script/Engine.World", function(_world)
         pcall(function()
-            ExecuteWithDelay(1000, function()
+            ExecuteWithDelay(1200, function()
                 onWorldChange()
             end)
         end)
     end)
 end)
 
--- One-shot culture probe after load
 ExecuteWithDelay(5000, function()
     pcall(function()
         ExecuteInGameThread(function()
@@ -1044,4 +1123,4 @@ LoopAsync(POLL_MS, function()
     return false
 end)
 
-log("loaded — settings i18n (zh/en), low-overhead poll")
+log("loaded — settings i18n (menu-only heavy work, gameplay idle)")
