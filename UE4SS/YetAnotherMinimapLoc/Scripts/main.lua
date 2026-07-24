@@ -16,7 +16,9 @@ local function log(msg)
 end
 
 local function isAlive(obj)
-    return obj ~= nil and pcall(function() return obj:IsValid() end) and obj:IsValid()
+    if obj == nil then return false end
+    local ok, valid = pcall(function() return obj:IsValid() end)
+    return ok and valid == true
 end
 
 local function asString(value)
@@ -28,7 +30,12 @@ local function asString(value)
         end
         return tostring(value)
     end)
-    if ok and type(s) == "string" then return s end
+    if ok and type(s) == "string" then
+        -- Strip common FText debug wrappers if present
+        s = s:gsub("^.-TEXT%((.*)%)%s*$", "%1")
+        s = s:gsub('^"(.*)"$', "%1")
+        return s
+    end
     return nil
 end
 
@@ -38,16 +45,63 @@ local function getText(tb)
         local t = tb:GetText()
         return asString(t)
     end)
-    if ok then return text end
+    if ok and type(text) == "string" and text ~= "" then return text end
+    -- Some widgets expose Text / Content instead of GetText
+    for _, prop in ipairs({ "Text", "Content" }) do
+        local ok2, val = pcall(function() return tb[prop] end)
+        if ok2 then
+            local s = asString(val)
+            if s and s ~= "" then return s end
+        end
+    end
     return nil
 end
 
 local function setText(tb, str)
     if not isAlive(tb) or type(str) ~= "string" then return false end
-    local ok = pcall(function()
+    local ok1 = pcall(function()
         tb:SetText(FText(str))
     end)
-    return ok
+    if ok1 then return true end
+    local ok2 = pcall(function()
+        tb:SetText(str)
+    end)
+    return ok2 == true
+end
+
+local function collectOf(className)
+    local out = {}
+    local ok, list = pcall(FindAllOf, className)
+    if not ok or list == nil then return out end
+    if type(list) == "table" then
+        for _, obj in pairs(list) do
+            if isAlive(obj) then table.insert(out, obj) end
+        end
+    elseif isAlive(list) then
+        table.insert(out, list)
+    end
+    return out
+end
+
+local function classNameOf(obj)
+    if not isAlive(obj) then return "" end
+    local ok, name = pcall(function()
+        local c = obj:GetClass()
+        if c and c.GetFName then return asString(c:GetFName()) end
+        if c and c.GetName then return asString(c:GetName()) end
+        return asString(c)
+    end)
+    return (ok and name) or ""
+end
+
+local function looksLikeTextWidget(obj)
+    local cn = classNameOf(obj)
+    if cn == "" then return false end
+    cn = cn:lower()
+    return cn:find("textblock", 1, true)
+        or cn:find("richtext", 1, true)
+        or cn:find("paltext", 1, true)
+        or cn == "text"
 end
 
 -- ---------------------------------------------------------------------------
@@ -412,6 +466,14 @@ local function trDesc(lang, keyOrText)
     return bag[key] or DESCS.en[key] or keyOrText
 end
 
+local function normalizeSettingKey(key)
+    if type(key) ~= "string" or key == "" then return nil end
+    -- Blueprint stores keys as "Section::Field" (e.g. General::Hide Map In Base)
+    local bare = key:match("::(.+)$")
+    if bare and bare ~= "" then return bare end
+    return key
+end
+
 local function readSettingKey(row)
     if not isAlive(row) then return nil end
     local key
@@ -419,130 +481,272 @@ local function readSettingKey(row)
         key = row.SettingKey
     end)
     if not ok then return nil end
-    return asString(key)
+    return normalizeSettingKey(asString(key))
+end
+
+local function applyLabelDesc(row, lang, useKey, labelWidget, descWidget)
+    if useKey and useKey ~= "" then
+        local lab = trLabel(lang, useKey)
+        local desc = trDesc(lang, useKey)
+        -- Only overwrite when we have a real translation (avoid painting "Section::Key")
+        if lab and lab ~= useKey then
+            setText(labelWidget, lab)
+        else
+            local cur = getText(labelWidget)
+            local bare = normalizeSettingKey(cur) or cur
+            if bare then
+                local t = trLabel(lang, bare)
+                if t and t ~= bare and t ~= cur then setText(labelWidget, t) end
+            end
+        end
+        if desc and desc ~= useKey then
+            setText(descWidget, desc)
+        else
+            local cur = getText(descWidget)
+            local bare = normalizeSettingKey(cur) or cur
+            if bare then
+                local t = trDesc(lang, bare)
+                if t and t ~= bare and t ~= cur then setText(descWidget, t) end
+            end
+        end
+        return
+    end
+    local labelText = getText(labelWidget)
+    local descText = getText(descWidget)
+    if labelText then
+        local bare = normalizeSettingKey(labelText) or CANONICAL[labelText] or labelText
+        local t = trLabel(lang, bare)
+        if t and t ~= labelText then setText(labelWidget, t) end
+    end
+    if descText then
+        local t = trDesc(lang, descText)
+        if t and t ~= descText then setText(descWidget, t) end
+    end
 end
 
 local function localizeToggleRow(row, lang)
     local key = readSettingKey(row)
     local labelText = getText(row.Label)
-    local descText = getText(row.TextBlock)
     local useKey = key
     if (not useKey or useKey == "") and labelText then
-        useKey = CANONICAL[labelText] or labelText
+        useKey = normalizeSettingKey(labelText) or CANONICAL[labelText] or labelText
     end
-    if useKey and useKey ~= "" then
-        setText(row.Label, trLabel(lang, useKey))
-        setText(row.TextBlock, trDesc(lang, useKey))
-    else
-        if labelText then setText(row.Label, trLabel(lang, labelText)) end
-        if descText then setText(row.TextBlock, trDesc(lang, descText)) end
-    end
+    applyLabelDesc(row, lang, useKey, row.Label, row.TextBlock)
+
     -- ON / OFF buttons
     local t1 = getText(row.btnOneText)
     local t2 = getText(row.btnTwoText)
-    if t1 then setText(row.btnOneText, trLabel(lang, CANONICAL[t1] or t1)) end
-    if t2 then setText(row.btnTwoText, trLabel(lang, CANONICAL[t2] or t2)) end
-    -- Force common ON/OFF even if custom casing
-    if t1 and (t1:upper() == "ON" or t1 == "开" or t1 == "开 " ) then setText(row.btnOneText, trLabel(lang, "ON")) end
-    if t2 and (t2:upper() == "OFF" or t2 == "关" or t2 == "关 ") then setText(row.btnTwoText, trLabel(lang, "OFF")) end
-    if not t1 then setText(row.btnOneText, trLabel(lang, "ON")) end
-    if not t2 then setText(row.btnTwoText, trLabel(lang, "OFF")) end
+    if t1 then
+        local u = t1:upper()
+        if u == "ON" or t1 == "开" then setText(row.btnOneText, trLabel(lang, "ON"))
+        else setText(row.btnOneText, trLabel(lang, CANONICAL[t1] or t1)) end
+    else
+        setText(row.btnOneText, trLabel(lang, "ON"))
+    end
+    if t2 then
+        local u = t2:upper()
+        if u == "OFF" or t2 == "关" then setText(row.btnTwoText, trLabel(lang, "OFF"))
+        else setText(row.btnTwoText, trLabel(lang, CANONICAL[t2] or t2)) end
+    else
+        setText(row.btnTwoText, trLabel(lang, "OFF"))
+    end
 end
 
 local function localizeSliderRow(row, lang)
     local key = readSettingKey(row)
     local labelText = getText(row.Label)
-    local descText = getText(row.TextBlock)
     local useKey = key
     if (not useKey or useKey == "") and labelText then
-        useKey = CANONICAL[labelText] or labelText
+        useKey = normalizeSettingKey(labelText) or CANONICAL[labelText] or labelText
     end
-    if useKey and useKey ~= "" then
-        setText(row.Label, trLabel(lang, useKey))
-        setText(row.TextBlock, trDesc(lang, useKey))
-    else
-        if labelText then setText(row.Label, trLabel(lang, labelText)) end
-        if descText then setText(row.TextBlock, trDesc(lang, descText)) end
-    end
+    applyLabelDesc(row, lang, useKey, row.Label, row.TextBlock)
 end
 
 local function localizeKeybindRow(row, lang)
-    localizeSliderRow(row, lang) -- same Label + TextBlock pattern
+    localizeSliderRow(row, lang)
 end
 
 local function localizeHeaderRow(row, lang)
     local text = getText(row.TextBlock)
-    if text then
-        setText(row.TextBlock, trLabel(lang, text))
+    if not text then return end
+    local bare = normalizeSettingKey(text) or text
+    -- Prefer section title; if current text is a known section description, map back to title.
+    local titleKey = bare
+    if not LABELS.en[bare] then
+        for k, v in pairs(DESCS.en) do
+            if v == text or v == bare then titleKey = k break end
+        end
+        for k, v in pairs(DESCS.zh) do
+            if v == text or v == bare then titleKey = k break end
+        end
+    end
+    local title = trLabel(lang, titleKey)
+    if title and title ~= text then
+        setText(row.TextBlock, title)
     end
 end
 
-local function walkWidgetTexts(root, lang, depth)
+local debugOnce = false
+local lastApplyStats = ""
+
+local function translateAnyString(lang, cur)
+    if not cur or cur == "" then return cur end
+    local bare = normalizeSettingKey(cur) or cur
+    -- Walk path is for chrome / section titles / ON-OFF only.
+    -- Never fall back to DESCS here: short labels would be replaced by long
+    -- tooltips (e.g. "Hide Map In Base" title -> full paragraph).
+    local t = trLabel(lang, bare)
+    if t ~= bare and t ~= cur then return t end
+    t = trLabel(lang, cur)
+    if t ~= cur then return t end
+    return cur
+end
+
+local function walkWidgetTexts(root, lang, depth, stats)
     depth = depth or 0
-    if depth > 12 or not isAlive(root) then return end
+    stats = stats or { visited = 0, changed = 0 }
+    if depth > 16 or not isAlive(root) then return stats end
+    stats.visited = stats.visited + 1
 
     -- Direct known TextBlock-ish properties on this object
     local names = {
         "TextBlock", "Label", "Title", "TitleText", "Header", "btnOneText", "btnTwoText",
-        "Text", "Content", "Description",
+        "Description", "Value",
     }
     for _, name in ipairs(names) do
         local ok, child = pcall(function() return root[name] end)
         if ok and isAlive(child) then
             local cur = getText(child)
             if cur and cur ~= "" then
-                local translated = trLabel(lang, cur)
-                if translated == cur then
-                    translated = trDesc(lang, cur)
-                end
+                local translated = translateAnyString(lang, cur)
                 if translated and translated ~= cur then
-                    setText(child, translated)
+                    if setText(child, translated) then
+                        stats.changed = stats.changed + 1
+                    end
+                end
+            elseif looksLikeTextWidget(child) then
+                -- property holds the text widget itself
+            end
+        end
+    end
+
+    -- If this node itself is a text widget, translate its content
+    if looksLikeTextWidget(root) then
+        local cur = getText(root)
+        if cur and cur ~= "" then
+            local translated = translateAnyString(lang, cur)
+            if translated and translated ~= cur then
+                if setText(root, translated) then
+                    stats.changed = stats.changed + 1
                 end
             end
         end
     end
 
-    -- Button caption via GetContent / child text if present
+    -- UPanelWidget children
     pcall(function()
         if root.GetChildrenCount ~= nil then
             local n = root:GetChildrenCount()
             if type(n) == "number" then
                 for i = 0, n - 1 do
                     local child = root:GetChildAt(i)
-                    walkWidgetTexts(child, lang, depth + 1)
+                    walkWidgetTexts(child, lang, depth + 1, stats)
                 end
             end
         end
     end)
+
+    -- UWidget GetAllChildren (TArray)
+    pcall(function()
+        if root.GetAllChildren ~= nil then
+            local children = root:GetAllChildren()
+            if children ~= nil then
+                local n = nil
+                pcall(function() n = children:GetArrayNum() end)
+                if type(n) ~= "number" then pcall(function() n = #children end) end
+                if type(n) == "number" then
+                    for i = 1, n do
+                        local child = children[i]
+                        if child == nil and children.Get then
+                            pcall(function() child = children:Get(i - 1) end)
+                        end
+                        walkWidgetTexts(child, lang, depth + 1, stats)
+                    end
+                end
+            end
+        end
+    end)
+
+    -- WidgetTree root for user widgets
+    pcall(function()
+        local tree = root.WidgetTree
+        if isAlive(tree) and isAlive(tree.RootWidget) then
+            walkWidgetTexts(tree.RootWidget, lang, depth + 1, stats)
+        end
+    end)
+
+    return stats
 end
 
 local function localizeSettingsPanel(panel, lang)
     if not isAlive(panel) then return end
 
-    -- Typed rows (preferred — SettingKey is authoritative)
-    local function each(className, fn)
-        local ok, list = pcall(FindAllOf, className)
-        if not ok or list == nil then return end
-        if type(list) == "table" then
-            for _, obj in pairs(list) do
-                if isAlive(obj) then fn(obj) end
-            end
-        elseif isAlive(list) then
-            fn(list)
-        end
+    local toggles = collectOf("WBP_SettingsRow_Toggle_C")
+    local sliders = collectOf("WBP_SettingsRow_Slider_C")
+    local keybinds = collectOf("WBP_SettingsRow_Keybind_C")
+    local headers = collectOf("WBP_SettingsRow_Header_C")
+
+    -- Also try fully-qualified blueprint paths (some UE4SS builds need them)
+    if #toggles == 0 then
+        toggles = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C")
+    end
+    if #sliders == 0 then
+        sliders = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Slider.WBP_SettingsRow_Slider_C")
+    end
+    if #keybinds == 0 then
+        keybinds = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Keybind.WBP_SettingsRow_Keybind_C")
+    end
+    if #headers == 0 then
+        headers = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Header.WBP_SettingsRow_Header_C")
     end
 
-    each("WBP_SettingsRow_Toggle_C", function(r) localizeToggleRow(r, lang) end)
-    each("WBP_SettingsRow_Slider_C", function(r) localizeSliderRow(r, lang) end)
-    each("WBP_SettingsRow_Keybind_C", function(r) localizeKeybindRow(r, lang) end)
-    each("WBP_SettingsRow_Header_C", function(r) localizeHeaderRow(r, lang) end)
+    for _, r in ipairs(toggles) do localizeToggleRow(r, lang) end
+    for _, r in ipairs(sliders) do localizeSliderRow(r, lang) end
+    for _, r in ipairs(keybinds) do localizeKeybindRow(r, lang) end
+    for _, r in ipairs(headers) do localizeHeaderRow(r, lang) end
 
-    -- Chrome: title + Reset / Save / Cancel button captions
-    walkWidgetTexts(panel, lang, 0)
+    -- Chrome + deep walk: title, Reset/Save/Cancel, any missed rows
+    local stats = { visited = 0, changed = 0 }
+    walkWidgetTexts(panel, lang, 0, stats)
     for _, name in ipairs({ "btnReset", "btnSave", "btnCancel", "ScrollBox" }) do
         local ok, child = pcall(function() return panel[name] end)
         if ok and isAlive(child) then
-            walkWidgetTexts(child, lang, 0)
+            walkWidgetTexts(child, lang, 0, stats)
+        end
+    end
+
+    local summary = string.format(
+        "lang=%s toggles=%d sliders=%d keybinds=%d headers=%d walk_changed=%d walk_visited=%d",
+        tostring(lang), #toggles, #sliders, #keybinds, #headers, stats.changed, stats.visited
+    )
+    if summary ~= lastApplyStats then
+        lastApplyStats = summary
+        log("apply " .. summary)
+    end
+
+    if not debugOnce and (#toggles + #sliders + #keybinds + #headers) > 0 then
+        debugOnce = true
+        local sample = toggles[1] or sliders[1] or keybinds[1]
+        if sample then
+            log(string.format(
+                "sample key=%s label=%s desc=%s",
+                tostring(readSettingKey(sample)),
+                tostring(getText(sample.Label)),
+                tostring(getText(sample.TextBlock))
+            ))
+        end
+        if headers[1] then
+            log("sample header=" .. tostring(getText(headers[1].TextBlock)))
         end
     end
 end
@@ -552,7 +756,7 @@ end
 -- ---------------------------------------------------------------------------
 local lastLocalizedAt = 0
 local lastPanelKey = nil
-local POLL_MS = 400
+local POLL_MS = 250
 
 local function objectKey(obj)
     if not isAlive(obj) then return nil end
@@ -564,16 +768,9 @@ local function objectKey(obj)
 end
 
 local function findSettingsPanels()
-    local found = {}
-    local ok, list = pcall(FindAllOf, "WBT_MinimapSettings_C")
-    if ok and list ~= nil then
-        if type(list) == "table" then
-            for _, obj in pairs(list) do
-                if isAlive(obj) then table.insert(found, obj) end
-            end
-        elseif isAlive(list) then
-            table.insert(found, list)
-        end
+    local found = collectOf("WBT_MinimapSettings_C")
+    if #found == 0 then
+        found = collectOf("/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C")
     end
     return found
 end
@@ -582,14 +779,17 @@ local function tickLocalize()
     local panels = findSettingsPanels()
     if #panels == 0 then
         lastPanelKey = nil
+        debugOnce = false
+        lastApplyStats = ""
         return
     end
 
-    local lang = detectMenuLanguage()
-    -- Re-apply often enough that late-built rows (after BuildSettingsRows) get covered.
+    local lang = detectMenuLanguage(true)
+    -- Re-apply continuously while open: blueprint BuildSettingsRows can repaint
+    -- English after our first pass (and late rows appear after Construct).
     local now = os.clock()
     local panelKey = objectKey(panels[1])
-    local force = (panelKey ~= lastPanelKey) or (now - lastLocalizedAt > 0.75)
+    local force = (panelKey ~= lastPanelKey) or (now - lastLocalizedAt > 0.35)
     if not force then return end
 
     lastPanelKey = panelKey
@@ -616,6 +816,9 @@ local function onWorldChange()
     log("world change; language cache cleared")
 end
 
+-- Avoid NotifyOnNewObject delayed callbacks that can throw
+-- "[Lua::Registry::get_function_ref] Ref was not function" on this UE4SS build.
+-- Polling is enough once the panel exists.
 pcall(function()
     NotifyOnNewObject("/Script/Engine.World", function(_world)
         pcall(function()
@@ -626,39 +829,13 @@ pcall(function()
     end)
 end)
 
--- Apply as soon as the settings widget is constructed (rows may appear a tick later).
-local function scheduleLocalize(panel, delayMs)
-    ExecuteWithDelay(delayMs, function()
-        ExecuteInGameThread(function()
-            pcall(function()
-                if not isAlive(panel) then return end
-                localizeSettingsPanel(panel, detectMenuLanguage(true))
-            end)
-        end)
-    end)
-end
-
-pcall(function()
-    NotifyOnNewObject("/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C", function(panel)
-        scheduleLocalize(panel, 50)
-        scheduleLocalize(panel, 250)
-        scheduleLocalize(panel, 600)
-    end)
-end)
-
--- Class-name fallback (path above can differ by pak mount)
-pcall(function()
-    NotifyOnNewObject("WBT_MinimapSettings_C", function(panel)
-        scheduleLocalize(panel, 100)
-        scheduleLocalize(panel, 400)
-    end)
-end)
-
 -- One-shot culture probe a few seconds after load (for log verification)
 ExecuteWithDelay(4000, function()
-    ExecuteInGameThread(function()
-        pcall(function()
-            detectMenuLanguage(true)
+    pcall(function()
+        ExecuteInGameThread(function()
+            pcall(function()
+                detectMenuLanguage(true)
+            end)
         end)
     end)
 end)
