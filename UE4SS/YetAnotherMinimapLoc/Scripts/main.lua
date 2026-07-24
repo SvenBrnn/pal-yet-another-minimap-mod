@@ -802,6 +802,59 @@ local function localizeFloatingSettingsButton(lang)
     return #buttons, changed
 end
 
+
+local function forceTranslateIconColor(panel, lang)
+    if lang ~= "zh" or not isAlive(panel) then return end
+    local labelZh = trLabel("zh", "Icon Color")
+    local descZh = trDesc("zh", "Icon Color")
+    local function hit(tb)
+        if not isAlive(tb) then return end
+        local cur = getText(tb)
+        if not cur or cur == "" then return end
+        local n = normalizeWs(cur)
+        if n == "Icon Color" or n == labelZh then
+            setText(tb, labelZh)
+            return
+        end
+        local lower = n:lower()
+        if lower:find("tint dungeons", 1, true)
+            or lower:find("fast travel points, chests", 1, true)
+            or n == normalizeWs(DESCS.en["Icon Color"] or "")
+        then
+            setText(tb, descZh)
+        end
+    end
+    -- Named props on panel tree
+    local function walk(root, depth)
+        depth = depth or 0
+        if depth > 14 or not isAlive(root) then return end
+        for _, name in ipairs({ "TextBlock", "Label", "Description", "Title", "Text" }) do
+            local ok, child = pcall(function() return root[name] end)
+            if ok then hit(child) end
+        end
+        if looksLikeTextWidget(root) then hit(root) end
+        pcall(function()
+            if root.GetChildrenCount ~= nil then
+                local n = root:GetChildrenCount()
+                if type(n) == "number" then
+                    for i = 0, n - 1 do walk(root:GetChildAt(i), depth + 1) end
+                end
+            end
+        end)
+        pcall(function()
+            local tree = root.WidgetTree
+            if isAlive(tree) and isAlive(tree.RootWidget) then
+                walk(tree.RootWidget, depth + 1)
+            end
+        end)
+    end
+    walk(panel, 0)
+    pcall(function()
+        local sb = panel.ScrollBox
+        if isAlive(sb) then walk(sb, 0) end
+    end)
+end
+
 local function localizeSettingsPanel(panel, lang)
     if not isAlive(panel) then return end
 
@@ -843,6 +896,9 @@ local function localizeSettingsPanel(panel, lang)
     for _, r in ipairs(toggles) do
         pcall(styleToggleButtons, r, lang)
     end
+
+    -- Color picker row is NOT a WBP_SettingsRow_*; force Icon Color label/desc.
+    forceTranslateIconColor(panel, lang)
 
     local summary = string.format(
         "lang=%s toggles=%d sliders=%d keybinds=%d headers=%d walk_changed=%d walk_visited=%d",
@@ -1135,10 +1191,18 @@ local function panelHasEnglishLabels()
         end
     end
     for _, h in ipairs(collectOf("WBP_SettingsRow_Header_C")) do
-        local t = getText(h.TextBlock)
-        if t == "General" or t == "Scan" or t == "Keymap" or t == "Zoom" or t == "Position and Size" then
+        local ht = getText(h.TextBlock)
+        if ht == "General" or ht == "Scan" or ht == "Keymap" or ht == "Zoom" or ht == "Position and Size" then
             return true
         end
+    end
+    -- Color row is not a SettingsRow_*; scan open panel text.
+    for _, panel in ipairs(collectOf("WBT_MinimapSettings_C")) do
+        -- cheap: if any known EN remains, force full apply (includes Icon Color)
+        local found = false
+        pcall(function()
+            forceTranslateIconColor(panel, "zh")
+        end)
     end
     return false
 end
