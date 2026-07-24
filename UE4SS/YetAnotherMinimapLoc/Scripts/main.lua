@@ -946,8 +946,8 @@ local function tickLocalize()
         return
     end
     if panelPhase == 0 then
-            nextPanelScanAt = now + 2.0
-        end
+        nextPanelScanAt = now + 2.0
+    end
 
     local panels = findSettingsPanels()
     if #panels == 0 then
