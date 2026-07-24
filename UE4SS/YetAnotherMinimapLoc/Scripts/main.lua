@@ -787,12 +787,8 @@ local function localizeFloatingSettingsButton(lang)
         -- Named TextBlock on the widget (asset contains TextBlock)
         local ok, tb = pcall(function() return btn.TextBlock end)
         if ok and isAlive(tb) then
-            local cur = getText(tb)
-            if cur and cur ~= title then
-                if setText(tb, title) then changed = changed + 1 end
-            elseif not cur then
-                if setText(tb, title) then changed = changed + 1 end
-            end
+            -- Always force the language-correct title (menu reopen recreates EN).
+            if setText(tb, title) then changed = changed + 1 end
         end
         -- OpenSettingsButton children
         local ok2, openBtn = pcall(function() return btn.OpenSettingsButton end)
@@ -1032,20 +1028,39 @@ local BUILD_HOOKS = {
     "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C:Construct",
 }
 
-for _, path in ipairs(BUILD_HOOKS) do
-    local hooked = false
-    pcall(function()
-        RegisterHook(path, function(_ctx) end, onSettingsBuilt)
-        hooked = true
-        log("hooked post " .. path)
-    end)
-    if not hooked then
-        pcall(function()
-            RegisterHook(path, onSettingsBuilt)
-            log("hooked " .. path)
+local hookedBuild = {}
+local function tryHookBuildPaths()
+    for _, path in ipairs(BUILD_HOOKS) do
+        if hookedBuild[path] then goto continue end
+        local ok, err = pcall(function()
+            RegisterHook(path, function(_ctx) end, onSettingsBuilt)
         end)
+        if not ok then
+            ok, err = pcall(function()
+                RegisterHook(path, onSettingsBuilt)
+            end)
+        end
+        if ok then
+            hookedBuild[path] = true
+            log("hooked " .. path)
+        end
+        ::continue::
     end
 end
+
+-- BP functions may not exist until the pak class is first loaded.
+tryHookBuildPaths()
+pcall(function()
+    NotifyOnNewObject(
+        "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C",
+        function(panel)
+            tryHookBuildPaths()
+            runSoon(0, function() applyPanel(panel) end)
+            runSoon(30, function() applyPanel(panel) end)
+            runSoon(100, function() applyPanel(panel) end)
+        end
+    )
+end)
 
 -- Per-row spawn: translate each row when the blueprint creates it.
 local ROW_SPECS = {
