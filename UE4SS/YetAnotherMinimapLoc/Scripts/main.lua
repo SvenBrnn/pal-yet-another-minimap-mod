@@ -838,6 +838,11 @@ local function localizeSettingsPanel(panel, lang)
         end
     end
 
+    -- Re-apply toggle chrome AFTER walk (walk can normalize "● 开启" back to "开启")
+    for _, r in ipairs(toggles) do
+        pcall(styleToggleButtons, r, lang)
+    end
+
     local summary = string.format(
         "lang=%s toggles=%d sliders=%d keybinds=%d headers=%d walk_changed=%d walk_visited=%d",
         tostring(lang), #toggles, #sliders, #keybinds, #headers, stats.changed, stats.visited
