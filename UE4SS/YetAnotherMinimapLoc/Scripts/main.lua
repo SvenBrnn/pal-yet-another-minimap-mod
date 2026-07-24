@@ -917,11 +917,17 @@ local function currentWorldName()
     pcall(function()
         if UEHelpers == nil then return end
         local w = UEHelpers.GetWorld()
-        if w == nil then return end
-        if w.GetName ~= nil then
+        if w == nil or not isAlive(w) then return end
+        -- Palworld UE4SS: GetFName():ToString() is the reliable map name
+        if w.GetFName ~= nil then
+            local fn = w:GetFName()
+            name = asString(fn)
+            if type(fn) == "userdata" and fn.ToString ~= nil then
+                name = asString(fn:ToString()) or name
+            end
+        end
+        if (name == nil or name == "") and w.GetName ~= nil then
             name = asString(w:GetName())
-        elseif w.GetFullName ~= nil then
-            name = asString(w:GetFullName())
         end
     end)
     cachedWorldName = name
@@ -929,26 +935,36 @@ local function currentWorldName()
     return name
 end
 
--- true  => title/login/splash/unknown (allow settings work)
--- false => likely in a gameplay map (skip panel FindAllOf entirely)
+-- true  => title/login/splash (or unknown early boot)
+-- false => gameplay map — skip all panel FindAllOf
 local function isMenuContext()
     local n = currentWorldName()
-    if n == nil or n == "" then
-        return true
+    if n ~= nil and n ~= "" then
+        if MENU_WORLDS[n] then return true end
+        local lower = n:lower()
+        if lower:find("title", 1, true)
+            or lower:find("login", 1, true)
+            or lower:find("splash", 1, true)
+            or lower:find("startup", 1, true)
+        then
+            return true
+        end
+        -- Named persistent level that isn't a known menu map => gameplay
+        return false
     end
-    if MENU_WORLDS[n] then
-        return true
+
+    -- World name unavailable: fall back to presence of a live player character.
+    local hasPlayer = false
+    pcall(function()
+        local pc = FindFirstOf("PalPlayerCharacter")
+        if pc ~= nil and isAlive(pc) then
+            hasPlayer = true
+        end
+    end)
+    if hasPlayer then
+        return false
     end
-    local lower = n:lower()
-    if lower:find("title", 1, true)
-        or lower:find("login", 1, true)
-        or lower:find("splash", 1, true)
-        or lower:find("startup", 1, true)
-        or lower:find("menu", 1, true)
-    then
-        return true
-    end
-    return false
+    return true
 end
 
 local function findSettingsPanels()
