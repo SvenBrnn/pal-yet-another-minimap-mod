@@ -439,6 +439,10 @@ local function buildCanonical()
     CANONICAL["关"] = "OFF"
     CANONICAL["开启"] = "ON"
     CANONICAL["关闭"] = "OFF"
+    CANONICAL["● 开启"] = "ON"
+    CANONICAL["● 关闭"] = "OFF"
+    CANONICAL["[ON]"] = "ON"
+    CANONICAL["[OFF]"] = "OFF"
 end
 buildCanonical()
 
@@ -533,36 +537,56 @@ end
 local function setTextColor(tb, r, g, b, a)
     if not isAlive(tb) then return false end
     a = a or 1.0
+    local linear = { R = r, G = g, B = b, A = a }
+    -- UTextBlock expects FSlateColor, not raw FLinearColor
     local ok = pcall(function()
-        tb:SetColorAndOpacity({ R = r, G = g, B = b, A = a })
+        tb:SetColorAndOpacity({ SpecifiedColor = linear, ColorUseRule = 0 })
     end)
     if ok then return true end
     ok = pcall(function()
-        local c = { R = r, G = g, B = b, A = a }
-        tb.ColorAndOpacity = c
+        tb:SetColorAndOpacity(linear)
     end)
     return ok == true
 end
 
 local function styleToggleButtons(row, lang)
-    local onLabel = trLabel(lang, "ON")
-    local offLabel = trLabel(lang, "OFF")
+    local isOn = nil
+    pcall(function() isOn = row.bIsOn end)
+
+    -- Clear, high-contrast labels (avoid single-glyph 开/关)
+    local onLabel = trLabel(lang, "ON")   -- 开启
+    local offLabel = trLabel(lang, "OFF") -- 关闭
+    if lang == "zh" then
+        if isOn == true then
+            onLabel = "● 开启"
+            offLabel = "关闭"
+        elseif isOn == false then
+            onLabel = "开启"
+            offLabel = "● 关闭"
+        end
+    else
+        if isOn == true then
+            onLabel = "[ON]"
+            offLabel = "OFF"
+        elseif isOn == false then
+            onLabel = "ON"
+            offLabel = "[OFF]"
+        end
+    end
+
     setText(row.btnOneText, onLabel)
     setText(row.btnTwoText, offLabel)
 
-    local isOn = nil
-    pcall(function() isOn = row.bIsOn end)
+    -- Bright white on selected side, muted gray on the other (readable on gray buttons)
     if isOn == true then
-        -- Selected ON: bright green-white; OFF side muted
-        setTextColor(row.btnOneText, 0.35, 0.95, 0.45, 1.0)
-        setTextColor(row.btnTwoText, 0.55, 0.55, 0.55, 0.85)
+        setTextColor(row.btnOneText, 1.0, 1.0, 1.0, 1.0)
+        setTextColor(row.btnTwoText, 0.45, 0.45, 0.48, 1.0)
     elseif isOn == false then
-        setTextColor(row.btnOneText, 0.55, 0.55, 0.55, 0.85)
-        setTextColor(row.btnTwoText, 0.95, 0.40, 0.40, 1.0)
+        setTextColor(row.btnOneText, 0.45, 0.45, 0.48, 1.0)
+        setTextColor(row.btnTwoText, 1.0, 1.0, 1.0, 1.0)
     else
-        -- Unknown state: neutral but still readable
-        setTextColor(row.btnOneText, 0.92, 0.92, 0.92, 1.0)
-        setTextColor(row.btnTwoText, 0.75, 0.75, 0.75, 1.0)
+        setTextColor(row.btnOneText, 0.95, 0.95, 0.95, 1.0)
+        setTextColor(row.btnTwoText, 0.95, 0.95, 0.95, 1.0)
     end
 end
 
