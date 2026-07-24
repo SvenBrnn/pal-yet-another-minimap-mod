@@ -589,16 +589,41 @@ end
 local debugOnce = false
 local lastApplyStats = ""
 
+local function normalizeWs(s)
+    if type(s) ~= "string" then return s end
+    return (s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+-- Exact English description -> translated description (safe: never matches short titles)
+local DESC_EN_TO_KEY = nil
+local function buildDescIndex()
+    DESC_EN_TO_KEY = {}
+    for k, v in pairs(DESCS.en) do
+        DESC_EN_TO_KEY[normalizeWs(v)] = k
+    end
+    -- also index Chinese so re-apply is stable
+    for k, v in pairs(DESCS.zh) do
+        DESC_EN_TO_KEY[normalizeWs(v)] = k
+    end
+end
+buildDescIndex()
+
 local function translateAnyString(lang, cur)
     if not cur or cur == "" then return cur end
     local bare = normalizeSettingKey(cur) or cur
-    -- Walk path is for chrome / section titles / ON-OFF only.
-    -- Never fall back to DESCS here: short labels would be replaced by long
-    -- tooltips (e.g. "Hide Map In Base" title -> full paragraph).
+    -- Labels / chrome first
     local t = trLabel(lang, bare)
     if t ~= bare and t ~= cur then return t end
     t = trLabel(lang, cur)
     if t ~= cur then return t end
+    -- Exact description paragraphs only (used by color picker rows etc. that
+    -- are not WBP_SettingsRow_*). Short labels never equal full EN descs.
+    local key = DESC_EN_TO_KEY[normalizeWs(cur)]
+    if key then
+        local bag = DESCS[lang] or DESCS.en
+        local d = bag[key] or DESCS.en[key]
+        if d and d ~= cur then return d end
+    end
     return cur
 end
 
