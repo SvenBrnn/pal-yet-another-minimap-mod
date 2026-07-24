@@ -870,11 +870,23 @@ local function localizeSettingsPanel(panel, lang)
 end
 
 -- ---------------------------------------------------------------------------
--- Poll while a settings panel exists
+-- Poll: keep this CHEAP. Full widget walks destroy FPS if done every tick.
+-- Strategy:
+--   * Floating HUD button: localize once per world, then stop.
+--   * Settings panel: full localize on open + one delayed follow-up for late rows.
+--   * While open: only refresh toggle chrome every few seconds (bIsOn changes).
+--   * English culture: almost no work after float button is done.
 -- ---------------------------------------------------------------------------
-local lastLocalizedAt = 0
+local POLL_MS = 1000
+
 local lastPanelKey = nil
-local POLL_MS = 250
+local panelPhase = 0          -- 0 idle, 1 opened(need full), 2 need follow-up, 3 settled
+local panelFollowupAt = 0
+local lastToggleStyleAt = 0
+local floatDone = false
+local nextFloatCheckAt = 0
+local nextPanelScanAt = 0
+local lastFloatLog = ""
 
 local function objectKey(obj)
     if not isAlive(obj) then return nil end
@@ -893,82 +905,124 @@ local function findSettingsPanels()
     return found
 end
 
-local lastFloatLog = ""
-local lastFloatAt = 0
+local function refreshToggleStylesOnly(lang)
+    local toggles = collectOf("WBP_SettingsRow_Toggle_C")
+    if #toggles == 0 then
+        toggles = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C")
+    end
+    for _, r in ipairs(toggles) do
+        pcall(styleToggleButtons, r, lang)
+    end
+    return #toggles
+end
 
 local function tickLocalize()
-    local lang = detectMenuLanguage(false)
     local now = os.clock()
+    local lang = detectMenuLanguage(false)
 
-    -- Floating open button is always on HUD — localize even when panel is closed.
-    if now - lastFloatAt > 0.8 then
-        lastFloatAt = now
+    -- --- Floating open button (once per world) ---
+    if not floatDone and now >= nextFloatCheckAt then
+        nextFloatCheckAt = now + 3.0
         local okf, nBtn, nCh = pcall(function()
-            return localizeFloatingSettingsButton(detectMenuLanguage(true))
+            return localizeFloatingSettingsButton(lang)
         end)
-        if okf then
+        if okf and nBtn and nBtn > 0 then
+            floatDone = true
             local msg = string.format("float buttons=%s changed=%s lang=%s", tostring(nBtn), tostring(nCh), tostring(lang))
-            if msg ~= lastFloatLog and nBtn and nBtn > 0 then
+            if msg ~= lastFloatLog then
                 lastFloatLog = msg
-                if nCh and nCh > 0 then log(msg) end
+                log(msg)
             end
         end
     end
 
-    local panels = findSettingsPanels()
-    if #panels == 0 then
-        lastPanelKey = nil
-        debugOnce = false
-        lastApplyStats = ""
+    -- English stock UI: nothing else to do after float button.
+    if lang ~= "zh" then
         return
     end
 
-    lang = detectMenuLanguage(true)
-    -- Re-apply continuously while open: blueprint BuildSettingsRows can repaint
-    -- English after our first pass (and late rows appear after Construct).
-    local panelKey = objectKey(panels[1])
-    local force = (panelKey ~= lastPanelKey) or (now - lastLocalizedAt > 0.35)
-    if not force then return end
-
-    lastPanelKey = panelKey
-    lastLocalizedAt = now
-
-    for _, panel in ipairs(panels) do
-        local ok, err = pcall(localizeSettingsPanel, panel, lang)
-        if not ok then
-            log("localize failed: " .. tostring(err))
+    -- Panel presence scan at ~1 Hz (FindAllOf is not free).
+    if now < nextPanelScanAt and panelPhase == 0 then
+        return
+    end
+    if panelPhase == 0 then
+            nextPanelScanAt = now + 2.0
         end
+
+    local panels = findSettingsPanels()
+    if #panels == 0 then
+        if lastPanelKey ~= nil then
+            lastPanelKey = nil
+            panelPhase = 0
+            debugOnce = false
+            lastApplyStats = ""
+        end
+        return
+    end
+
+    local panelKey = objectKey(panels[1])
+    if panelKey ~= lastPanelKey then
+        lastPanelKey = panelKey
+        panelPhase = 1
+    end
+
+    if panelPhase == 1 then
+        -- Full localize once on open
+        for _, panel in ipairs(panels) do
+            local ok, err = pcall(localizeSettingsPanel, panel, lang)
+            if not ok then log("localize failed: " .. tostring(err)) end
+        end
+        panelPhase = 2
+        panelFollowupAt = now + 0.75
+        return
+    end
+
+    if panelPhase == 2 and now >= panelFollowupAt then
+        -- One follow-up for rows built a tick late (color picker etc.)
+        for _, panel in ipairs(panels) do
+            local ok, err = pcall(localizeSettingsPanel, panel, lang)
+            if not ok then log("localize follow-up failed: " .. tostring(err)) end
+        end
+        panelPhase = 3
+        lastToggleStyleAt = now
+        return
+    end
+
+    -- Settled: only keep toggle selected-state chrome fresh (cheap).
+    if panelPhase == 3 and now - lastToggleStyleAt >= 2.0 then
+        lastToggleStyleAt = now
+        pcall(refreshToggleStylesOnly, lang)
     end
 end
 
--- World change -> drop language cache (title screens sometimes report "en")
--- Debounced: NotifyOnNewObject(World) fires very frequently during streaming.
+-- World change -> drop caches (debounced; World notifies are noisy)
 local lastWorldClearAt = 0
 local function onWorldChange()
     local now = os.clock()
-    if now - lastWorldClearAt < 5 then return end
+    if now - lastWorldClearAt < 8 then return end
     lastWorldClearAt = now
     clearLanguageCache()
     lastPanelKey = nil
-    lastLocalizedAt = 0
-    log("world change; language cache cleared")
+    panelPhase = 0
+    floatDone = false
+    nextFloatCheckAt = 0
+    nextPanelScanAt = 0
+    lastFloatLog = ""
+    log("world change; localization caches cleared")
 end
 
--- Avoid NotifyOnNewObject delayed callbacks that can throw
--- "[Lua::Registry::get_function_ref] Ref was not function" on this UE4SS build.
--- Polling is enough once the panel exists.
 pcall(function()
     NotifyOnNewObject("/Script/Engine.World", function(_world)
         pcall(function()
-            ExecuteWithDelay(800, function()
+            ExecuteWithDelay(1000, function()
                 onWorldChange()
             end)
         end)
     end)
 end)
 
--- One-shot culture probe a few seconds after load (for log verification)
-ExecuteWithDelay(4000, function()
+-- One-shot culture probe after load
+ExecuteWithDelay(5000, function()
     pcall(function()
         ExecuteInGameThread(function()
             pcall(function()
@@ -990,4 +1044,4 @@ LoopAsync(POLL_MS, function()
     return false
 end)
 
-log("loaded — settings panel follows game language (zh/en)")
+log("loaded — settings i18n (zh/en), low-overhead poll")
