@@ -618,7 +618,15 @@ local function translateAnyString(lang, cur)
     if t ~= cur then return t end
     -- Exact description paragraphs only (used by color picker rows etc. that
     -- are not WBP_SettingsRow_*). Short labels never equal full EN descs.
-    local key = DESC_EN_TO_KEY[normalizeWs(cur)]
+    local norm = normalizeWs(cur)
+    local key = DESC_EN_TO_KEY[norm]
+    if not key then
+        -- Multiline / soft-wrap variants: match distinctive EN substrings
+        local lower = norm:lower()
+        if lower:find("tint dungeons", 1, true) or lower:find("fast travel points, chests", 1, true) then
+            key = "Icon Color"
+        end
+    end
     if key then
         local bag = DESCS[lang] or DESCS.en
         local d = bag[key] or DESCS.en[key]
