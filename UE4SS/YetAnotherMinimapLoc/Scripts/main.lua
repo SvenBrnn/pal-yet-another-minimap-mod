@@ -871,9 +871,10 @@ local function localizeSettingsPanel(panel, lang)
 end
 
 -- ---------------------------------------------------------------------------
--- Event-driven localization (NOT delayed "replace English later").
--- Detect game culture once; when zh, apply Chinese as settings rows/widgets
--- are constructed (BuildSettingsRows / NotifyOnNewObject). English leaves stock.
+-- Event-driven localization gated by game culture (zh* -> Chinese).
+-- Apply SYNCHRONOUSLY in BuildSettingsRows/Construct post-hooks and on
+-- widget spawn. Avoid ExecuteWithDelay chains here — they invalidate
+-- UE4SS Lua registry refs ("Ref was not function") and break the 2nd open.
 -- ---------------------------------------------------------------------------
 
 local MENU_WORLDS = {
@@ -884,6 +885,7 @@ local MENU_WORLDS = {
 
 local cachedWorldName = nil
 local cachedWorldAt = 0
+local lastApplyGen = 0
 
 local function currentWorldName()
     local now = os.clock()
@@ -938,53 +940,25 @@ local function wantChinese()
     return detectMenuLanguage(false) == "zh"
 end
 
-local function runSoon(delayMs, fn)
-    pcall(function()
-        ExecuteWithDelay(delayMs, function()
-            pcall(function()
-                ExecuteInGameThread(function()
-                    pcall(fn)
-                end)
-            end)
-        end)
-    end)
+local function applyAllOpenPanels()
+    if not wantChinese() then return 0 end
+    local panels = collectOf("WBT_MinimapSettings_C")
+    if #panels == 0 then
+        panels = collectOf("/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C")
+    end
+    local n = 0
+    for _, panel in ipairs(panels) do
+        if isAlive(panel) then
+            pcall(localizeSettingsPanel, panel, "zh")
+            n = n + 1
+        end
+    end
+    return n
 end
 
-local function applyPanel(panel)
-    if not isAlive(panel) then return end
+local function applyFloatNow()
     if not wantChinese() then return end
-    pcall(localizeSettingsPanel, panel, "zh")
-end
-
-local function applyToggle(row)
-    if not isAlive(row) then return end
-    if not wantChinese() then return end
-    pcall(localizeToggleRow, row, "zh")
-end
-
-local function applySlider(row)
-    if not isAlive(row) then return end
-    if not wantChinese() then return end
-    pcall(localizeSliderRow, row, "zh")
-end
-
-local function applyKeybind(row)
-    if not isAlive(row) then return end
-    if not wantChinese() then return end
-    pcall(localizeKeybindRow, row, "zh")
-end
-
-local function applyHeader(row)
-    if not isAlive(row) then return end
-    if not wantChinese() then return end
-    pcall(localizeHeaderRow, row, "zh")
-end
-
-local function applyFloatButton(_btn)
-    if not wantChinese() then return end
-    pcall(function()
-        localizeFloatingSettingsButton("zh")
-    end)
+    pcall(function() localizeFloatingSettingsButton("zh") end)
 end
 
 local function panelFromHookContext(ctx)
@@ -1000,27 +974,18 @@ local function panelFromHookContext(ctx)
     return panel
 end
 
+-- Called as UE4SS post-hook after BuildSettingsRows / Construct.
+-- MUST stay synchronous (no ExecuteWithDelay) to keep hook registry healthy.
 local function onSettingsBuilt(ctx)
+    if not wantChinese() then return end
+    lastApplyGen = lastApplyGen + 1
     local panel = panelFromHookContext(ctx)
-    -- Tied to build event: apply as soon as blueprint finishes writing EN FTexts.
-    runSoon(0, function()
-        if isAlive(panel) then
-            applyPanel(panel)
-        else
-            for _, p in ipairs(collectOf("WBT_MinimapSettings_C")) do
-                applyPanel(p)
-            end
-        end
-    end)
-    runSoon(60, function()
-        if isAlive(panel) then
-            applyPanel(panel)
-        else
-            for _, p in ipairs(collectOf("WBT_MinimapSettings_C")) do
-                applyPanel(p)
-            end
-        end
-    end)
+    if isAlive(panel) then
+        pcall(localizeSettingsPanel, panel, "zh")
+    else
+        applyAllOpenPanels()
+    end
+    applyFloatNow()
 end
 
 local BUILD_HOOKS = {
@@ -1032,121 +997,132 @@ local hookedBuild = {}
 local function tryHookBuildPaths()
     for _, path in ipairs(BUILD_HOOKS) do
         if not hookedBuild[path] then
-            local ok, err = pcall(function()
+            local ok = pcall(function()
+                -- Prefer post-hook form when available
                 RegisterHook(path, function(_ctx) end, onSettingsBuilt)
             end)
             if not ok then
-                ok, err = pcall(function()
+                ok = pcall(function()
                     RegisterHook(path, onSettingsBuilt)
                 end)
             end
             if ok then
                 hookedBuild[path] = true
                 log("hooked " .. path)
-            elseif err and not hookedBuild[path .. ":err"] then
-                hookedBuild[path .. ":err"] = true
-                log("hook failed " .. path .. " :: " .. tostring(err))
             end
         end
     end
 end
 
--- BP functions may not exist until the pak class is first loaded.
 tryHookBuildPaths()
+
+-- When the settings widget class first appears, hook + apply immediately.
 pcall(function()
     NotifyOnNewObject(
         "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C",
         function(panel)
             tryHookBuildPaths()
-            runSoon(0, function() applyPanel(panel) end)
-            runSoon(30, function() applyPanel(panel) end)
-            runSoon(100, function() applyPanel(panel) end)
-        end
-    )
-end)
-
--- Per-row spawn: translate each row when the blueprint creates it.
-local ROW_SPECS = {
-    {
-        paths = {
-            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C",
-            "WBP_SettingsRow_Toggle_C",
-        },
-        apply = applyToggle,
-    },
-    {
-        paths = {
-            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Slider.WBP_SettingsRow_Slider_C",
-            "WBP_SettingsRow_Slider_C",
-        },
-        apply = applySlider,
-    },
-    {
-        paths = {
-            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Keybind.WBP_SettingsRow_Keybind_C",
-            "WBP_SettingsRow_Keybind_C",
-        },
-        apply = applyKeybind,
-    },
-    {
-        paths = {
-            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Header.WBP_SettingsRow_Header_C",
-            "WBP_SettingsRow_Header_C",
-        },
-        apply = applyHeader,
-    },
-}
-
-for _, spec in ipairs(ROW_SPECS) do
-    for _, classPath in ipairs(spec.paths) do
-        pcall(function()
-            NotifyOnNewObject(classPath, function(row)
-                runSoon(0, function() spec.apply(row) end)
-                runSoon(40, function() spec.apply(row) end)
-            end)
-        end)
-    end
-end
-
-local BTN_PATHS = {
-    "/Game/Mods/YetAnotherMinimap/WBP_MinimapSettingsButton.WBP_MinimapSettingsButton_C",
-    "WBP_MinimapSettingsButton_C",
-}
-for _, classPath in ipairs(BTN_PATHS) do
-    pcall(function()
-        NotifyOnNewObject(classPath, function(btn)
-            runSoon(0, function() applyFloatButton(btn) end)
-            runSoon(40, function() applyFloatButton(btn) end)
-            runSoon(160, function() applyFloatButton(btn) end)
-        end)
-    end)
-end
-
-pcall(function()
-    NotifyOnNewObject(
-        "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C",
-        function(panel)
-            runSoon(0, function() applyPanel(panel) end)
-            runSoon(40, function() applyPanel(panel) end)
-            runSoon(120, function() applyPanel(panel) end)
+            if wantChinese() and isAlive(panel) then
+                -- Rows may still be filling this frame; apply now and once more
+                -- via a *single* next-tick LoopAsync flag (not ExecuteWithDelay).
+                pcall(localizeSettingsPanel, panel, "zh")
+                pendingPanelApply = panel
+                pendingPanelFrames = 2
+            end
         end
     )
 end)
 pcall(function()
     NotifyOnNewObject("WBT_MinimapSettings_C", function(panel)
-        runSoon(0, function() applyPanel(panel) end)
-        runSoon(80, function() applyPanel(panel) end)
+        tryHookBuildPaths()
+        if wantChinese() and isAlive(panel) then
+            pcall(localizeSettingsPanel, panel, "zh")
+            pendingPanelApply = panel
+            pendingPanelFrames = 2
+        end
     end)
 end)
 
--- Safety net only: if a panel is open on the menu and still shows EN keys, fix once.
--- Not the main path — main path is build/row hooks above.
-local FALLBACK_MS = 2500
-local lastFallbackAt = 0
+-- Per-row spawn: apply as each row is constructed (SettingKey may fill same frame).
+local function watchRows(classPath, applyFn)
+    pcall(function()
+        NotifyOnNewObject(classPath, function(row)
+            if not wantChinese() then return end
+            if not isAlive(row) then return end
+            pcall(applyFn, row, "zh")
+            -- one deferred apply via pending list (frame-based, not Delay registry)
+            pendingRows = pendingRows or {}
+            table.insert(pendingRows, { row = row, apply = applyFn, left = 1 })
+        end)
+    end)
+end
+
+watchRows("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C", localizeToggleRow)
+watchRows("WBP_SettingsRow_Toggle_C", localizeToggleRow)
+watchRows("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Slider.WBP_SettingsRow_Slider_C", localizeSliderRow)
+watchRows("WBP_SettingsRow_Slider_C", localizeSliderRow)
+watchRows("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Keybind.WBP_SettingsRow_Keybind_C", localizeKeybindRow)
+watchRows("WBP_SettingsRow_Keybind_C", localizeKeybindRow)
+watchRows("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Header.WBP_SettingsRow_Header_C", localizeHeaderRow)
+watchRows("WBP_SettingsRow_Header_C", localizeHeaderRow)
+
+pcall(function()
+    NotifyOnNewObject(
+        "/Game/Mods/YetAnotherMinimap/WBP_MinimapSettingsButton.WBP_MinimapSettingsButton_C",
+        function(_btn)
+            applyFloatNow()
+            pendingFloatFrames = 3
+        end
+    )
+end)
+pcall(function()
+    NotifyOnNewObject("WBP_MinimapSettingsButton_C", function(_btn)
+        applyFloatNow()
+        pendingFloatFrames = 3
+    end)
+end)
+
+-- Frame-based pending work (LoopAsync). No ExecuteWithDelay registry churn.
+pendingPanelApply = nil
+pendingPanelFrames = 0
+pendingRows = {}
+pendingFloatFrames = 0
+
+local function pumpPending()
+    if pendingFloatFrames and pendingFloatFrames > 0 then
+        pendingFloatFrames = pendingFloatFrames - 1
+        applyFloatNow()
+    end
+
+    if pendingPanelFrames and pendingPanelFrames > 0 then
+        pendingPanelFrames = pendingPanelFrames - 1
+        if isAlive(pendingPanelApply) then
+            pcall(localizeSettingsPanel, pendingPanelApply, "zh")
+        else
+            applyAllOpenPanels()
+        end
+        if pendingPanelFrames <= 0 then
+            pendingPanelApply = nil
+        end
+    end
+
+    if pendingRows and #pendingRows > 0 then
+        local nextList = {}
+        for _, item in ipairs(pendingRows) do
+            if isAlive(item.row) then
+                pcall(item.apply, item.row, "zh")
+                if item.left > 1 then
+                    item.left = item.left - 1
+                    table.insert(nextList, item)
+                end
+            end
+        end
+        pendingRows = nextList
+    end
+end
 
 local function panelHasEnglishLabels()
-    local toggles = collectOf("WBP_SettingsRow_Toggle_C")
-    for _, r in ipairs(toggles) do
+    for _, r in ipairs(collectOf("WBP_SettingsRow_Toggle_C")) do
         local lab = getText(r.Label)
         if lab == "Mod Logic Enabled"
             or lab == "Rotate Map"
@@ -1158,44 +1134,67 @@ local function panelHasEnglishLabels()
             return true
         end
     end
-    local headers = collectOf("WBP_SettingsRow_Header_C")
-    for _, h in ipairs(headers) do
+    for _, h in ipairs(collectOf("WBP_SettingsRow_Header_C")) do
         local t = getText(h.TextBlock)
-        if t == "General" or t == "Scan" or t == "Keymap" or t == "Zoom" then
+        if t == "General" or t == "Scan" or t == "Keymap" or t == "Zoom" or t == "Position and Size" then
             return true
         end
     end
     return false
 end
 
-local function fallbackTick()
+local lastFallbackAt = 0
+local lastToggleStyleAt = 0
+
+local function menuFallbackTick()
+    pumpPending()
+
     if not wantChinese() then return end
     if not isMenuContext() then return end
+
     local now = os.clock()
-    if now - lastFallbackAt < 2.0 then return end
-    lastFallbackAt = now
 
-    pcall(function() localizeFloatingSettingsButton("zh") end)
-
+    -- If settings panel is open with EN leftovers, repair (covers 2nd-open race).
     local panels = collectOf("WBT_MinimapSettings_C")
-    if #panels == 0 then return end
-    if panelHasEnglishLabels() then
-        for _, panel in ipairs(panels) do
-            applyPanel(panel)
-        end
-        log("fallback: repaired English leftovers after menu reopen")
-    else
-        local toggles = collectOf("WBP_SettingsRow_Toggle_C")
-        for _, r in ipairs(toggles) do
-            pcall(styleToggleButtons, r, "zh")
+    if #panels > 0 then
+        if panelHasEnglishLabels() then
+            if now - lastFallbackAt >= 0.35 then
+                lastFallbackAt = now
+                for _, panel in ipairs(panels) do
+                    pcall(localizeSettingsPanel, panel, "zh")
+                end
+                applyFloatNow()
+                log("repair: English labels detected on open panel")
+            end
+        elseif now - lastToggleStyleAt >= 2.0 then
+            lastToggleStyleAt = now
+            for _, r in ipairs(collectOf("WBP_SettingsRow_Toggle_C")) do
+                pcall(styleToggleButtons, r, "zh")
+            end
         end
     end
+
+    -- Keep floating button correct on title screen
+    applyFloatNow()
 end
 
-LoopAsync(FALLBACK_MS, function()
+-- 250ms is fine on MENU only for pending pumps; gameplay returns immediately.
+LoopAsync(250, function()
     pcall(function()
         ExecuteInGameThread(function()
-            pcall(fallbackTick)
+            pcall(function()
+                -- Always pump short pending work if any
+                local busy = (pendingPanelFrames and pendingPanelFrames > 0)
+                    or (pendingFloatFrames and pendingFloatFrames > 0)
+                    or (pendingRows and #pendingRows > 0)
+                if busy then
+                    pumpPending()
+                    return
+                end
+                if isMenuContext() then
+                    menuFallbackTick()
+                end
+            end)
         end)
     end)
     return false
@@ -1203,33 +1202,38 @@ end)
 
 pcall(function()
     NotifyOnNewObject("/Script/Engine.World", function(_world)
-        pcall(function()
-            ExecuteWithDelay(400, function()
-                clearLanguageCache()
-                cachedWorldName = nil
-                cachedWorldAt = 0
-            end)
-        end)
+        cachedWorldName = nil
+        cachedWorldAt = 0
+        -- Do not clear language via Delay; just invalidate world cache.
+        pcall(clearLanguageCache)
+        tryHookBuildPaths()
     end)
 end)
 
-ExecuteWithDelay(2500, function()
+-- Initial ready probe (one-shot is OK via LoopAsync counter)
+local readyLeft = 12 -- ~3s at 250ms
+LoopAsync(250, function()
+    readyLeft = readyLeft - 1
+    if readyLeft > 0 then return false end
     pcall(function()
         ExecuteInGameThread(function()
             pcall(function()
+                tryHookBuildPaths()
                 local lang = detectMenuLanguage(true)
                 log(string.format(
-                    "ready lang=%s world=%s menu=%s",
+                    "ready lang=%s world=%s menu=%s hooks=%s",
                     tostring(lang),
                     tostring(currentWorldName()),
-                    tostring(isMenuContext())
+                    tostring(isMenuContext()),
+                    tostring(hookedBuild[BUILD_HOOKS[1]] == true)
                 ))
                 if lang == "zh" then
-                    localizeFloatingSettingsButton("zh")
+                    applyFloatNow()
                 end
             end)
         end)
     end)
+    return true -- stop this ready loop
 end)
 
-log("loaded — event-driven i18n (BuildSettingsRows / row spawn; lang-gated)")
+log("loaded — event-driven i18n (sync BuildSettingsRows hook; lang-gated; no Delay thrash)")
