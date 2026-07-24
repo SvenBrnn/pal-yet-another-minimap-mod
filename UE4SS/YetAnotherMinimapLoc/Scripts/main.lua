@@ -1031,20 +1031,23 @@ local BUILD_HOOKS = {
 local hookedBuild = {}
 local function tryHookBuildPaths()
     for _, path in ipairs(BUILD_HOOKS) do
-        if hookedBuild[path] then goto continue end
-        local ok, err = pcall(function()
-            RegisterHook(path, function(_ctx) end, onSettingsBuilt)
-        end)
-        if not ok then
-            ok, err = pcall(function()
-                RegisterHook(path, onSettingsBuilt)
+        if not hookedBuild[path] then
+            local ok, err = pcall(function()
+                RegisterHook(path, function(_ctx) end, onSettingsBuilt)
             end)
+            if not ok then
+                ok, err = pcall(function()
+                    RegisterHook(path, onSettingsBuilt)
+                end)
+            end
+            if ok then
+                hookedBuild[path] = true
+                log("hooked " .. path)
+            elseif err and not hookedBuild[path .. ":err"] then
+                hookedBuild[path .. ":err"] = true
+                log("hook failed " .. path .. " :: " .. tostring(err))
+            end
         end
-        if ok then
-            hookedBuild[path] = true
-            log("hooked " .. path)
-        end
-        ::continue::
     end
 end
 
