@@ -875,38 +875,19 @@ local function localizeSettingsPanel(panel, lang)
 end
 
 -- ---------------------------------------------------------------------------
--- Poll: keep this CHEAP. Settings UI only exists on title/main-menu flows.
--- During actual gameplay we do almost nothing (no FindAllOf spam).
+-- Event-driven localization (NOT delayed "replace English later").
+-- Detect game culture once; when zh, apply Chinese as settings rows/widgets
+-- are constructed (BuildSettingsRows / NotifyOnNewObject). English leaves stock.
 -- ---------------------------------------------------------------------------
-local POLL_MS = 1500
 
--- Title / login / splash maps where the minimap settings button exists.
 local MENU_WORLDS = {
     PL_PPSplash = true,
     PL_Login = true,
     PL_Title = true,
 }
 
-local lastPanelKey = nil
-local panelPhase = 0          -- 0 idle, 1 opened(need full), 2 need follow-up, 3 settled
-local panelFollowupAt = 0
-local lastToggleStyleAt = 0
-local floatDone = false
-local nextFloatCheckAt = 0
-local nextPanelScanAt = 0
-local lastFloatLog = ""
-local lastMenuContext = nil
 local cachedWorldName = nil
 local cachedWorldAt = 0
-
-local function objectKey(obj)
-    if not isAlive(obj) then return nil end
-    local ok, s = pcall(function()
-        return string.format("%s", obj:GetFullName())
-    end)
-    if ok then return s end
-    return tostring(obj)
-end
 
 local function currentWorldName()
     local now = os.clock()
@@ -918,12 +899,12 @@ local function currentWorldName()
         if UEHelpers == nil then return end
         local w = UEHelpers.GetWorld()
         if w == nil or not isAlive(w) then return end
-        -- Palworld UE4SS: GetFName():ToString() is the reliable map name
         if w.GetFName ~= nil then
             local fn = w:GetFName()
-            name = asString(fn)
             if type(fn) == "userdata" and fn.ToString ~= nil then
-                name = asString(fn:ToString()) or name
+                name = asString(fn:ToString())
+            else
+                name = asString(fn)
             end
         end
         if (name == nil or name == "") and w.GetName ~= nil then
@@ -935,8 +916,6 @@ local function currentWorldName()
     return name
 end
 
--- true  => title/login/splash (or unknown early boot)
--- false => gameplay map — skip all panel FindAllOf
 local function isMenuContext()
     local n = currentWorldName()
     if n ~= nil and n ~= "" then
@@ -949,194 +928,290 @@ local function isMenuContext()
         then
             return true
         end
-        -- Named persistent level that isn't a known menu map => gameplay
         return false
     end
-
-    -- World name unavailable: fall back to presence of a live player character.
     local hasPlayer = false
     pcall(function()
         local pc = FindFirstOf("PalPlayerCharacter")
-        if pc ~= nil and isAlive(pc) then
-            hasPlayer = true
+        if pc ~= nil and isAlive(pc) then hasPlayer = true end
+    end)
+    return not hasPlayer
+end
+
+local function wantChinese()
+    return detectMenuLanguage(false) == "zh"
+end
+
+local function runSoon(delayMs, fn)
+    pcall(function()
+        ExecuteWithDelay(delayMs, function()
+            pcall(function()
+                ExecuteInGameThread(function()
+                    pcall(fn)
+                end)
+            end)
+        end)
+    end)
+end
+
+local function applyPanel(panel)
+    if not isAlive(panel) then return end
+    if not wantChinese() then return end
+    pcall(localizeSettingsPanel, panel, "zh")
+end
+
+local function applyToggle(row)
+    if not isAlive(row) then return end
+    if not wantChinese() then return end
+    pcall(localizeToggleRow, row, "zh")
+end
+
+local function applySlider(row)
+    if not isAlive(row) then return end
+    if not wantChinese() then return end
+    pcall(localizeSliderRow, row, "zh")
+end
+
+local function applyKeybind(row)
+    if not isAlive(row) then return end
+    if not wantChinese() then return end
+    pcall(localizeKeybindRow, row, "zh")
+end
+
+local function applyHeader(row)
+    if not isAlive(row) then return end
+    if not wantChinese() then return end
+    pcall(localizeHeaderRow, row, "zh")
+end
+
+local function applyFloatButton(_btn)
+    if not wantChinese() then return end
+    pcall(function()
+        localizeFloatingSettingsButton("zh")
+    end)
+end
+
+local function panelFromHookContext(ctx)
+    if ctx == nil then return nil end
+    local panel = nil
+    pcall(function()
+        if type(ctx) == "table" and ctx.get ~= nil then
+            panel = ctx:get()
+        else
+            panel = ctx
         end
     end)
-    if hasPlayer then
-        return false
-    end
-    return true
+    return panel
 end
 
-local function findSettingsPanels()
-    local found = collectOf("WBT_MinimapSettings_C")
-    if #found == 0 then
-        found = collectOf("/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C")
-    end
-    return found
-end
-
-local function refreshToggleStylesOnly(lang)
-    local toggles = collectOf("WBP_SettingsRow_Toggle_C")
-    if #toggles == 0 then
-        toggles = collectOf("/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C")
-    end
-    for _, r in ipairs(toggles) do
-        pcall(styleToggleButtons, r, lang)
-    end
-    return #toggles
-end
-
-local function tickLocalize()
-    local now = os.clock()
-    local lang = detectMenuLanguage(false)
-    local menu = isMenuContext()
-
-    if menu ~= lastMenuContext then
-        lastMenuContext = menu
-        log(string.format(
-            "context=%s world=%s lang=%s",
-            menu and "menu" or "gameplay",
-            tostring(currentWorldName()),
-            tostring(lang)
-        ))
-        if not menu then
-            -- Entered a save/world: drop panel state; keep floatDone so we don't
-            -- keep re-touching the HUD button every few seconds.
-            lastPanelKey = nil
-            panelPhase = 0
-            nextPanelScanAt = now + 30
+local function onSettingsBuilt(ctx)
+    local panel = panelFromHookContext(ctx)
+    -- Tied to build event: apply as soon as blueprint finishes writing EN FTexts.
+    runSoon(0, function()
+        if isAlive(panel) then
+            applyPanel(panel)
         else
-            -- Back on title/menu: allow a fresh float pass if needed.
-            nextFloatCheckAt = 0
-            nextPanelScanAt = 0
-        end
-    end
-
-    -- --- Floating open button ---
-    -- Once per menu session is enough; in gameplay only try once if not done.
-    if not floatDone and now >= nextFloatCheckAt then
-        nextFloatCheckAt = now + (menu and 2.5 or 8.0)
-        local okf, nBtn, nCh = pcall(function()
-            return localizeFloatingSettingsButton(lang)
-        end)
-        if okf and nBtn and nBtn > 0 then
-            floatDone = true
-            local msg = string.format("float buttons=%s changed=%s lang=%s", tostring(nBtn), tostring(nCh), tostring(lang))
-            if msg ~= lastFloatLog then
-                lastFloatLog = msg
-                log(msg)
+            for _, p in ipairs(collectOf("WBT_MinimapSettings_C")) do
+                applyPanel(p)
             end
         end
-    end
-
-    -- Gameplay: no settings UI exists — do not FindAllOf the panel forever.
-    if not menu then
-        return
-    end
-
-    -- English stock UI on menu: nothing else after float button.
-    if lang ~= "zh" then
-        return
-    end
-
-    -- Panel presence scan (menu only). Slow when idle; fast after open.
-    if now < nextPanelScanAt and panelPhase == 0 then
-        return
-    end
-    if panelPhase == 0 then
-        nextPanelScanAt = now + 2.5
-    end
-
-    local panels = findSettingsPanels()
-    if #panels == 0 then
-        if lastPanelKey ~= nil then
-            lastPanelKey = nil
-            panelPhase = 0
-            debugOnce = false
-            lastApplyStats = ""
+    end)
+    runSoon(60, function()
+        if isAlive(panel) then
+            applyPanel(panel)
+        else
+            for _, p in ipairs(collectOf("WBT_MinimapSettings_C")) do
+                applyPanel(p)
+            end
         end
-        return
-    end
+    end)
+end
 
-    local panelKey = objectKey(panels[1])
-    if panelKey ~= lastPanelKey then
-        lastPanelKey = panelKey
-        panelPhase = 1
-    end
+local BUILD_HOOKS = {
+    "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C:BuildSettingsRows",
+    "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C:Construct",
+}
 
-    if panelPhase == 1 then
-        for _, panel in ipairs(panels) do
-            local ok, err = pcall(localizeSettingsPanel, panel, lang)
-            if not ok then log("localize failed: " .. tostring(err)) end
-        end
-        panelPhase = 2
-        panelFollowupAt = now + 0.75
-        return
-    end
-
-    if panelPhase == 2 and now >= panelFollowupAt then
-        for _, panel in ipairs(panels) do
-            local ok, err = pcall(localizeSettingsPanel, panel, lang)
-            if not ok then log("localize follow-up failed: " .. tostring(err)) end
-        end
-        panelPhase = 3
-        lastToggleStyleAt = now
-        return
-    end
-
-    if panelPhase == 3 and now - lastToggleStyleAt >= 2.5 then
-        lastToggleStyleAt = now
-        pcall(refreshToggleStylesOnly, lang)
+for _, path in ipairs(BUILD_HOOKS) do
+    local hooked = false
+    pcall(function()
+        RegisterHook(path, function(_ctx) end, onSettingsBuilt)
+        hooked = true
+        log("hooked post " .. path)
+    end)
+    if not hooked then
+        pcall(function()
+            RegisterHook(path, onSettingsBuilt)
+            log("hooked " .. path)
+        end)
     end
 end
 
--- World change -> drop caches (debounced; World notifies are noisy)
-local lastWorldClearAt = 0
-local function onWorldChange()
+-- Per-row spawn: translate each row when the blueprint creates it.
+local ROW_SPECS = {
+    {
+        paths = {
+            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Toggle.WBP_SettingsRow_Toggle_C",
+            "WBP_SettingsRow_Toggle_C",
+        },
+        apply = applyToggle,
+    },
+    {
+        paths = {
+            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Slider.WBP_SettingsRow_Slider_C",
+            "WBP_SettingsRow_Slider_C",
+        },
+        apply = applySlider,
+    },
+    {
+        paths = {
+            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Keybind.WBP_SettingsRow_Keybind_C",
+            "WBP_SettingsRow_Keybind_C",
+        },
+        apply = applyKeybind,
+    },
+    {
+        paths = {
+            "/Game/Mods/YetAnotherMinimap/Components/WBP_SettingsRow_Header.WBP_SettingsRow_Header_C",
+            "WBP_SettingsRow_Header_C",
+        },
+        apply = applyHeader,
+    },
+}
+
+for _, spec in ipairs(ROW_SPECS) do
+    for _, classPath in ipairs(spec.paths) do
+        pcall(function()
+            NotifyOnNewObject(classPath, function(row)
+                runSoon(0, function() spec.apply(row) end)
+                runSoon(40, function() spec.apply(row) end)
+            end)
+        end)
+    end
+end
+
+local BTN_PATHS = {
+    "/Game/Mods/YetAnotherMinimap/WBP_MinimapSettingsButton.WBP_MinimapSettingsButton_C",
+    "WBP_MinimapSettingsButton_C",
+}
+for _, classPath in ipairs(BTN_PATHS) do
+    pcall(function()
+        NotifyOnNewObject(classPath, function(btn)
+            runSoon(0, function() applyFloatButton(btn) end)
+            runSoon(40, function() applyFloatButton(btn) end)
+            runSoon(160, function() applyFloatButton(btn) end)
+        end)
+    end)
+end
+
+pcall(function()
+    NotifyOnNewObject(
+        "/Game/Mods/YetAnotherMinimap/WBT_MinimapSettings.WBT_MinimapSettings_C",
+        function(panel)
+            runSoon(0, function() applyPanel(panel) end)
+            runSoon(40, function() applyPanel(panel) end)
+            runSoon(120, function() applyPanel(panel) end)
+        end
+    )
+end)
+pcall(function()
+    NotifyOnNewObject("WBT_MinimapSettings_C", function(panel)
+        runSoon(0, function() applyPanel(panel) end)
+        runSoon(80, function() applyPanel(panel) end)
+    end)
+end)
+
+-- Safety net only: if a panel is open on the menu and still shows EN keys, fix once.
+-- Not the main path — main path is build/row hooks above.
+local FALLBACK_MS = 2500
+local lastFallbackAt = 0
+
+local function panelHasEnglishLabels()
+    local toggles = collectOf("WBP_SettingsRow_Toggle_C")
+    for _, r in ipairs(toggles) do
+        local lab = getText(r.Label)
+        if lab == "Mod Logic Enabled"
+            or lab == "Rotate Map"
+            or lab == "Round Map"
+            or lab == "Hide Map In Base"
+            or lab == "Opacity"
+            or lab == "Debug"
+        then
+            return true
+        end
+    end
+    local headers = collectOf("WBP_SettingsRow_Header_C")
+    for _, h in ipairs(headers) do
+        local t = getText(h.TextBlock)
+        if t == "General" or t == "Scan" or t == "Keymap" or t == "Zoom" then
+            return true
+        end
+    end
+    return false
+end
+
+local function fallbackTick()
+    if not wantChinese() then return end
+    if not isMenuContext() then return end
     local now = os.clock()
-    if now - lastWorldClearAt < 8 then return end
-    lastWorldClearAt = now
-    -- Do NOT force floatDone=false here: world streaming during gameplay would
-    -- re-trigger HUD work every few seconds. Menu entry resets via isMenuContext.
-    clearLanguageCache()
-    lastPanelKey = nil
-    panelPhase = 0
-    nextPanelScanAt = 0
-    lastMenuContext = nil
-    cachedWorldName = nil
-    cachedWorldAt = 0
+    if now - lastFallbackAt < 2.0 then return end
+    lastFallbackAt = now
+
+    pcall(function() localizeFloatingSettingsButton("zh") end)
+
+    local panels = collectOf("WBT_MinimapSettings_C")
+    if #panels == 0 then return end
+    if panelHasEnglishLabels() then
+        for _, panel in ipairs(panels) do
+            applyPanel(panel)
+        end
+        log("fallback: repaired English leftovers after menu reopen")
+    else
+        local toggles = collectOf("WBP_SettingsRow_Toggle_C")
+        for _, r in ipairs(toggles) do
+            pcall(styleToggleButtons, r, "zh")
+        end
+    end
 end
+
+LoopAsync(FALLBACK_MS, function()
+    pcall(function()
+        ExecuteInGameThread(function()
+            pcall(fallbackTick)
+        end)
+    end)
+    return false
+end)
 
 pcall(function()
     NotifyOnNewObject("/Script/Engine.World", function(_world)
         pcall(function()
-            ExecuteWithDelay(1200, function()
-                onWorldChange()
+            ExecuteWithDelay(400, function()
+                clearLanguageCache()
+                cachedWorldName = nil
+                cachedWorldAt = 0
             end)
         end)
     end)
 end)
 
-ExecuteWithDelay(5000, function()
+ExecuteWithDelay(2500, function()
     pcall(function()
         ExecuteInGameThread(function()
             pcall(function()
-                detectMenuLanguage(true)
+                local lang = detectMenuLanguage(true)
+                log(string.format(
+                    "ready lang=%s world=%s menu=%s",
+                    tostring(lang),
+                    tostring(currentWorldName()),
+                    tostring(isMenuContext())
+                ))
+                if lang == "zh" then
+                    localizeFloatingSettingsButton("zh")
+                end
             end)
         end)
     end)
 end)
 
-LoopAsync(POLL_MS, function()
-    local ok, err = pcall(function()
-        ExecuteInGameThread(function()
-            pcall(tickLocalize)
-        end)
-    end)
-    if not ok then
-        pcall(function() log("poll error: " .. tostring(err)) end)
-    end
-    return false
-end)
-
-log("loaded — settings i18n (menu-only heavy work, gameplay idle)")
+log("loaded — event-driven i18n (BuildSettingsRows / row spawn; lang-gated)")
