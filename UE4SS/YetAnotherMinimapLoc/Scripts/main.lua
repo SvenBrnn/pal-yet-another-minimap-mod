@@ -241,8 +241,9 @@ local LABELS = {
         ["Reset"] = "重置",
         ["Save"] = "保存",
         ["Cancel"] = "取消",
-        ["ON"] = "开",
-        ["OFF"] = "关",
+        -- Longer labels so selected state is easier to read than single 开/关
+        ["ON"] = "开启",
+        ["OFF"] = "关闭",
         ["General"] = "常规",
         ["Position and Size"] = "位置与大小",
         ["Scan"] = "扫描显示",
@@ -433,6 +434,11 @@ local function buildCanonical()
     for key, _ in pairs(LABELS.en) do
         CANONICAL[key] = key
     end
+    -- Aliases for short toggle labels used by older builds / partial applies
+    CANONICAL["开"] = "ON"
+    CANONICAL["关"] = "OFF"
+    CANONICAL["开启"] = "ON"
+    CANONICAL["关闭"] = "OFF"
 end
 buildCanonical()
 
@@ -524,6 +530,42 @@ local function applyLabelDesc(row, lang, useKey, labelWidget, descWidget)
     end
 end
 
+local function setTextColor(tb, r, g, b, a)
+    if not isAlive(tb) then return false end
+    a = a or 1.0
+    local ok = pcall(function()
+        tb:SetColorAndOpacity({ R = r, G = g, B = b, A = a })
+    end)
+    if ok then return true end
+    ok = pcall(function()
+        local c = { R = r, G = g, B = b, A = a }
+        tb.ColorAndOpacity = c
+    end)
+    return ok == true
+end
+
+local function styleToggleButtons(row, lang)
+    local onLabel = trLabel(lang, "ON")
+    local offLabel = trLabel(lang, "OFF")
+    setText(row.btnOneText, onLabel)
+    setText(row.btnTwoText, offLabel)
+
+    local isOn = nil
+    pcall(function() isOn = row.bIsOn end)
+    if isOn == true then
+        -- Selected ON: bright green-white; OFF side muted
+        setTextColor(row.btnOneText, 0.35, 0.95, 0.45, 1.0)
+        setTextColor(row.btnTwoText, 0.55, 0.55, 0.55, 0.85)
+    elseif isOn == false then
+        setTextColor(row.btnOneText, 0.55, 0.55, 0.55, 0.85)
+        setTextColor(row.btnTwoText, 0.95, 0.40, 0.40, 1.0)
+    else
+        -- Unknown state: neutral but still readable
+        setTextColor(row.btnOneText, 0.92, 0.92, 0.92, 1.0)
+        setTextColor(row.btnTwoText, 0.75, 0.75, 0.75, 1.0)
+    end
+end
+
 local function localizeToggleRow(row, lang)
     local key = readSettingKey(row)
     local labelText = getText(row.Label)
@@ -532,24 +574,7 @@ local function localizeToggleRow(row, lang)
         useKey = normalizeSettingKey(labelText) or CANONICAL[labelText] or labelText
     end
     applyLabelDesc(row, lang, useKey, row.Label, row.TextBlock)
-
-    -- ON / OFF buttons
-    local t1 = getText(row.btnOneText)
-    local t2 = getText(row.btnTwoText)
-    if t1 then
-        local u = t1:upper()
-        if u == "ON" or t1 == "开" then setText(row.btnOneText, trLabel(lang, "ON"))
-        else setText(row.btnOneText, trLabel(lang, CANONICAL[t1] or t1)) end
-    else
-        setText(row.btnOneText, trLabel(lang, "ON"))
-    end
-    if t2 then
-        local u = t2:upper()
-        if u == "OFF" or t2 == "关" then setText(row.btnTwoText, trLabel(lang, "OFF"))
-        else setText(row.btnTwoText, trLabel(lang, CANONICAL[t2] or t2)) end
-    else
-        setText(row.btnTwoText, trLabel(lang, "OFF"))
-    end
+    styleToggleButtons(row, lang)
 end
 
 local function localizeSliderRow(row, lang)
@@ -586,8 +611,6 @@ local function localizeHeaderRow(row, lang)
     end
 end
 
-local debugOnce = false
-local lastApplyStats = ""
 
 local function normalizeWs(s)
     if type(s) ~= "string" then return s end
@@ -721,6 +744,39 @@ local function walkWidgetTexts(root, lang, depth, stats)
     return stats
 end
 
+local debugOnce = false
+local lastApplyStats = ""
+
+local function localizeFloatingSettingsButton(lang)
+    local buttons = collectOf("WBP_MinimapSettingsButton_C")
+    if #buttons == 0 then
+        buttons = collectOf("/Game/Mods/YetAnotherMinimap/WBP_MinimapSettingsButton.WBP_MinimapSettingsButton_C")
+    end
+    local title = trLabel(lang, "Minimap Settings")
+    local changed = 0
+    for _, btn in ipairs(buttons) do
+        -- Named TextBlock on the widget (asset contains TextBlock)
+        local ok, tb = pcall(function() return btn.TextBlock end)
+        if ok and isAlive(tb) then
+            local cur = getText(tb)
+            if cur and cur ~= title then
+                if setText(tb, title) then changed = changed + 1 end
+            elseif not cur then
+                if setText(tb, title) then changed = changed + 1 end
+            end
+        end
+        -- OpenSettingsButton children
+        local ok2, openBtn = pcall(function() return btn.OpenSettingsButton end)
+        if ok2 and isAlive(openBtn) then
+            local stats = walkWidgetTexts(openBtn, lang, 0, { visited = 0, changed = 0 })
+            changed = changed + (stats.changed or 0)
+        end
+        local stats2 = walkWidgetTexts(btn, lang, 0, { visited = 0, changed = 0 })
+        changed = changed + (stats2.changed or 0)
+    end
+    return #buttons, changed
+end
+
 local function localizeSettingsPanel(panel, lang)
     if not isAlive(panel) then return end
 
@@ -808,7 +864,28 @@ local function findSettingsPanels()
     return found
 end
 
+local lastFloatLog = ""
+local lastFloatAt = 0
+
 local function tickLocalize()
+    local lang = detectMenuLanguage(false)
+    local now = os.clock()
+
+    -- Floating open button is always on HUD — localize even when panel is closed.
+    if now - lastFloatAt > 0.8 then
+        lastFloatAt = now
+        local okf, nBtn, nCh = pcall(function()
+            return localizeFloatingSettingsButton(detectMenuLanguage(true))
+        end)
+        if okf then
+            local msg = string.format("float buttons=%s changed=%s lang=%s", tostring(nBtn), tostring(nCh), tostring(lang))
+            if msg ~= lastFloatLog and nBtn and nBtn > 0 then
+                lastFloatLog = msg
+                if nCh and nCh > 0 then log(msg) end
+            end
+        end
+    end
+
     local panels = findSettingsPanels()
     if #panels == 0 then
         lastPanelKey = nil
@@ -817,10 +894,9 @@ local function tickLocalize()
         return
     end
 
-    local lang = detectMenuLanguage(true)
+    lang = detectMenuLanguage(true)
     -- Re-apply continuously while open: blueprint BuildSettingsRows can repaint
     -- English after our first pass (and late rows appear after Construct).
-    local now = os.clock()
     local panelKey = objectKey(panels[1])
     local force = (panelKey ~= lastPanelKey) or (now - lastLocalizedAt > 0.35)
     if not force then return end
